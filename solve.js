@@ -1,7 +1,11 @@
-// csv-reader-fast v2 — a fast drop-in for csv-reader 1.0.0 (make.fun).
-// Same answers on every input, faster: a record whose line holds no quote is
-// split at once; the rest is scanned with native indexOf/slice instead of one
-// character at a time. No dependencies, no state kept between calls.
+// csv-reader-fast v3 — same answers as csv-reader 1.0.0, faster.
+// v2 changes: (1) no line slice for quoted records — the quote check is a
+// plain indexOf('"', pos) against the line end; (2) readUnquoted/readQuoted
+// write their result into shared variables instead of allocating a return
+// object per field; (3) charCodeAt instead of string indexing in hot checks;
+// (4) a quoted field's newlines are counted only when its closing quote is
+// past the line end (otherwise the content cannot hold one).
+// No dependencies, no state kept between calls.
 
 const COMMA = 0;
 const LINE_BREAK = 1;
@@ -24,13 +28,17 @@ export function run(input) {
   // Index of the '\n' ending the line `pos` is on (-1: none), kept current
   // so unquoted fields need no newline search of their own.
   let lineEnd = -1;
+  // Shared result slots for the field readers (no per-field object).
+  let fValue = '';
+  let fEnded = 0;
+  let fAdded = 0;
 
   function error(code) {
     errors.push({ code, line: recordLine, row: recordRow });
   }
 
   // An unquoted field from `start`, with `value` already in it.
-  // Returns {value, ended, added}: added counts the characters kept here.
+  // Sets fValue/fEnded/fAdded; added counts the characters kept here.
   function readUnquoted(start, value) {
     const comma = text.indexOf(',', start);
     let end, ended;
@@ -82,17 +90,19 @@ export function run(input) {
     } else {
       pos = end + (ended === COMMA ? 1 : 0);
     }
-    return { value, ended, added };
+    fValue = value;
+    fEnded = ended;
+    fAdded = added;
   }
 
-  // A quoted field whose opening quote is at pos.
+  // A quoted field whose opening quote is at pos. Sets fValue/fEnded/fAdded.
   function readQuoted() {
     const open = pos;
     const openLine = line;
     // The closing quote: the first '"' not followed by '"'.
     let q = text.indexOf('"', pos + 1);
     let doubled = false;
-    while (q !== -1 && text[q + 1] === '"') {
+    while (q !== -1 && text.charCodeAt(q + 1) === 34) {
       doubled = true;
       q = text.indexOf('"', q + 2);
     }
@@ -102,7 +112,8 @@ export function run(input) {
       pos = open + 1;
       line = openLine;
       error('unterminated_quote');
-      return readUnquoted(open + 1, '"');
+      readUnquoted(open + 1, '"');
+      return;
     }
     const content = text.slice(pos + 1, q);
     let value;
@@ -110,13 +121,17 @@ export function run(input) {
     if (cr === -1) {
       // No CR in the content: doubled quotes un-double, newlines count lines.
       value = doubled ? content.replaceAll('""', '"') : content;
-      let c = 0;
-      let k = content.indexOf('\n');
-      while (k !== -1) {
-        c++;
-        k = content.indexOf('\n', k + 1);
+      // The content holds a newline only when the closing quote is past the
+      // line end; otherwise skip the count entirely.
+      if (lineEnd !== -1 && q > lineEnd) {
+        let c = 0;
+        let k = content.indexOf('\n');
+        while (k !== -1) {
+          c++;
+          k = content.indexOf('\n', k + 1);
+        }
+        line += c;
       }
-      line += c;
     } else {
       // CRs inside quotes: each CRLF / lone CR becomes one LF and one line.
       // Rare: build it by scanning the content once.
@@ -151,36 +166,48 @@ export function run(input) {
     if (line !== openLine) lineEnd = text.indexOf('\n', q + 1);
     if (q + 1 >= n) {
       pos = n;
-      return { value, ended: END };
+      fValue = value;
+      fEnded = END;
+      fAdded = 0;
+      return;
     }
-    const c = text[q + 1];
-    if (c === ',') {
+    const c = text.charCodeAt(q + 1);
+    if (c === 44) {
       pos = q + 2;
-      return { value, ended: COMMA };
+      fValue = value;
+      fEnded = COMMA;
+      fAdded = 0;
+      return;
     }
-    if (c === '\n') {
+    if (c === 10) {
       line++;
       pos = q + 2;
-      return { value, ended: LINE_BREAK };
+      fValue = value;
+      fEnded = LINE_BREAK;
+      fAdded = 0;
+      return;
     }
-    if (c === '\r' && text[q + 2] === '\n') {
+    if (c === 13 && text.charCodeAt(q + 2) === 10) {
       line++;
       pos = q + 3;
-      return { value, ended: LINE_BREAK };
+      fValue = value;
+      fEnded = LINE_BREAK;
+      fAdded = 0;
+      return;
     }
     // What follows the closing quote is appended as it stands.
-    const junk = readUnquoted(q + 1, value);
-    if (junk.added > 0) error('quote_junk');
-    return junk;
+    readUnquoted(q + 1, value);
+    if (fAdded > 0) error('quote_junk');
   }
 
   while (true) {
     // Lines with no characters are no records.
     while (pos < n) {
-      if (text[pos] === '\n') {
+      const c = text.charCodeAt(pos);
+      if (c === 10) {
         pos++;
         line++;
-      } else if (text[pos] === '\r' && text[pos + 1] === '\n') {
+      } else if (c === 13 && text.charCodeAt(pos + 1) === 10) {
         pos += 2;
         line++;
       } else {
@@ -194,13 +221,13 @@ export function run(input) {
 
     // Fast path: a record whose line holds no quote is one line; split it at once.
     const nl = text.indexOf('\n', pos);
-    const lineEndAt = nl === -1 ? n : nl;
     lineEnd = nl;
-    const rawLine = text.slice(pos, lineEndAt);
+    const q0 = text.indexOf('"', pos);
     let fields;
-    if (rawLine.indexOf('"') === -1) {
-      let lineStr = rawLine;
+    if (q0 === -1 || (nl !== -1 && q0 > nl)) {
       const atEof = nl === -1;
+      const lineEndAt = atEof ? n : nl;
+      let lineStr = text.slice(pos, lineEndAt);
       const r = lineStr.indexOf('\r');
       if (r !== -1) {
         if (r === lineStr.length - 1 && !atEof) {
@@ -229,13 +256,13 @@ export function run(input) {
       if (fields.length === 1 && fields[0] === '') continue;
     } else {
       fields = [];
-      let field;
       let quoted;
       do {
-        quoted = text[pos] === '"';
-        field = quoted ? readQuoted() : readUnquoted(pos, '');
-        fields.push(field.value);
-      } while (field.ended === COMMA);
+        quoted = text.charCodeAt(pos) === 34;
+        if (quoted) readQuoted();
+        else readUnquoted(pos, '');
+        fields.push(fValue);
+      } while (fEnded === COMMA);
       if (fields.length === 1 && fields[0] === '' && !quoted) continue;
     }
 
